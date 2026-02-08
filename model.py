@@ -1,0 +1,177 @@
+import math
+import torch
+import torch.nn as nn
+from typing import Optional
+
+
+class RMSNorm(nn.Module):
+    """
+    RMSNorm：仅通过均方根（Root Mean Square）进行归一化，不减均值。
+
+    为什么很多 LLM 使用 RMSNorm 而不是 LayerNorm：
+    - 数值稳定性更好：RMSNorm不做均值扣除，减少减法造成的数值抵消，
+      在半精度（fp16/bf16）训练与推理中更稳，梯度更平滑。
+    - 计算与内存更省：只需计算均方值（x^2 的均值），省去均值与方差的两次统计，
+      访存/通信负担更小，在张量并行、流水线并行下更友好。
+    - 与批大小和序列长度解耦：与LayerNorm一样独立于batch/seq，但在小批量、
+      长序列和较大学习率的设定下，实证更易收敛、更稳（如 T5、LLaMA 的报告）。
+    - 简化实现与参数：常见实现仅使用缩放参数（无偏置），与预归一化（Pre-Norm）残差结构搭配稳定。
+
+    归一化方式：
+        y = x / sqrt(mean(x^2) + eps) * weight
+
+    形状约定：
+        输入 x 形状为 (..., dim)，在最后一维 dim 上归一化；weight 的形状为 [dim]，按最后一维广播。
+    """
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        # root mean square
+        ms = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(ms + self.eps)
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, dim) 
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+
+def compute_freqs_cis(seq_len: int, dim: int, base=10000.0):
+    """
+    计算固定频率 cis 用于 RoPE 嵌入和固定位置编码。
+    返回形状为 [seq_len, dim//2] 的复数张量，每个元素为 cis(θ) = cos(θ) + i·sin(θ) = e^{iθ}。
+    """
+    t = torch.arange(seq_len)
+    # theta_j
+    assert dim % 2 == 0, "dim 需为偶数以匹配频率对"
+    freqs = base ** (-torch.arange(0, dim, 2) / dim)
+    # m * theta_j
+    freqs = torch.outer(t, freqs)  # [seq_len, dim//2]
+    # exp ** (i*m*theta_j)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+
+def apply_rope_emb(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor):
+    """
+    应用 RoPE 嵌入到查询 q 和键 k 上
+    """
+    # view_as_complex: [[q_0, q_1], [q_2, q_3],...] -> [q_0 + i*q_1, q_2 + i*q_3, ...]
+    # (b, t, n_head, head_dim) -> (b, t, n_head, head_dim//2)
+    q = torch.view_as_complex(q.float().reshape(*q.shape[:-1], -1, 2))
+    k = torch.view_as_complex(k.float().reshape(*k.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.reshape(1, freqs_cis.shape[0], 1, freqs_cis.shape[1])
+    # (b, t, n_head, head_dim//2) -> (b, t, n_head, head_dim//2, 2) -> (b, t, n_head, head_dim)
+    q = torch.view_as_real(q * freqs_cis).flatten(3)
+    k = torch.view_as_real(k * freqs_cis).flatten(3)
+    return q, k
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout=0.0):
+        super().__init__()
+        assert d_model % n_head == 0, "d_model 必须能整除 n_head"
+        self.d_model = d_model
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        assert self.head_dim % 2 == 0, "head_dim 必须为偶数以支持 RoPE"
+        # nn.Linear 类似于 nn.Parameter(torch.empty(d_model, n_head * head_dim))
+        # 然后 nn.init.kaiming_uniform_ 初始化
+        self.wq = nn.Linear(d_model, n_head * head_dim, bias=False)
+        self.wk = nn.Linear(d_model, n_head * head_dim, bias=False)
+        self.wv = nn.Linear(d_model, n_head * head_dim, bias=False)
+        self.wo = nn.Linear(n_head * head_dim, d_model, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        支持掩码的多头注意力层
+        """
+        # x shape: [b, t, d_model]
+        q = self.wq(x)  # [b, t, n_head * head_dim]
+        k = self.wk(x)
+        v = self.wv(x)
+        # 分头，需先 reshape 再 transpose -> [b, n_head, t, head_dim]
+        q = q.reshape(q.shape[0], q.shape[1], self.n_head, self.head_dim).transpose(1, 2)
+        k = k.reshape(k.shape[0], k.shape[1], self.n_head, self.head_dim).transpose(1, 2)
+        v = v.reshape(v.shape[0], v.shape[1], self.n_head, self.head_dim).transpose(1, 2)
+        # RoPE 嵌入
+        q, k = apply_rope_emb(q, k, freq_cis)
+        # 多头注意力 [b, n_head, t, t]
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+        attn = torch.softmax(scores, dim=-1)
+        # 1. Attention Dropout: 在 softmax 之后，乘 v 之前
+        attn = self.attn_dropout(attn)
+        o = attn @ v
+        # 合并头 [b, n_head, t, head_dim] -> [b, t, n_head * head_dim]
+        o = o.transpose(1, 2).reshape(o.shape[0], -1, self.n_head * self.head_dim)
+        return self.wo(o)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_hidden):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.down_proj = nn.Linear(d_hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        # [b, t, d_model] -> [b, t, d_hidden] -> [b, t, d_model]
+        return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_head, d_hidden, dropout=0.0):
+        super().__init__()
+        self.attn = MultiHeadAttention(d_model, n_head, dropout)
+        self.ffn = FeedForward(d_model, d_hidden)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        支持掩码的 Transformer 层
+        """
+        # 自注意力
+        attn = self.attn(self.norm1(x), freq_cis, mask)
+        # 残差连接
+        x = x + attn
+        # 前馈网络
+        ffn = self.ffn(self.norm2(x))
+        # 残差连接
+        x = x + ffn
+        return x
+
+
+class TransformerModel(nn.Module):
+    def __init__(self, d_model, n_head, d_hidden, n_layer, vocab_size, max_seq_len=8192, rope_theta=10000.0, dropout=0.0):
+        super().__init__()
+        self.embeddings = nn.Embedding(vocab_size, d_model)
+        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_hidden, dropout) for _ in range(n_layer)])
+        self.norm = RMSNorm(d_model)
+        self.output = nn.Linear(d_model, vocab_size, bias=False)
+        # RoPE 频率按 head_dim 计算，而不是 d_model
+        self.freq_cis = compute_freqs_cis(max_seq_len, d_model // n_head, rope_theta)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        支持掩码的 Transformer 模型
+        """
+        # 词嵌入
+        x = self.embeddings(tokens)
+        # 因果三角掩码（加性）：未来位置设为 -inf，其余为 0
+        # torch.triu 生成上三角矩阵，diagonal=1 表示主对角线以下为 0
+        t = tokens.shape[1]
+        mask = torch.triu(torch.full((t, t), float('-inf'), device=tokens.device), diagonal=1).view(1, 1, t, t)
+        # 层循环
+        # 将 RoPE 频率裁剪到当前序列长度并移动到正确设备
+        freqs_cis = self.freq_cis[:t].to(x.device)
+        for layer in self.layers:
+            x = layer(x, freqs_cis, mask)
+        # 输出层
+        return self.output(self.norm(x))
