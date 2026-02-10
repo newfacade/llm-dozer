@@ -20,6 +20,7 @@ project:
     - file: 2-2-tokenizer.ipynb
     - file: 2-3-dataloader.ipynb
     - file: 2-4-train.ipynb
+    - file: 3-1-transformers.ipynb
 site:
   template: book-theme
   # options:

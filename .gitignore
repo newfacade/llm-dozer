@@ -209,3 +209,4 @@ data/*
 _build/*
 *.pt
 *.json
+Qwen3-0.6B/*
